@@ -1069,14 +1069,14 @@ static so_handle cr_so_load(const std::string &filename) {
     return new_dll;
 }
 
-static cr_plugin_main_func cr_so_symbol(so_handle handle) {
+static void *cr_so_symbol(so_handle handle, const char *symbol) {
     CR_ASSERT(handle);
-    auto new_main = (cr_plugin_main_func)GetProcAddress(handle, CR_MAIN_FUNC);
-    if (!new_main) {
-        CR_ERROR("Couldn't find plugin entry point: %d\n",
+    auto new_sym = GetProcAddress(handle, symbol);
+    if (!new_sym) {
+        CR_ERROR("Couldn't find plugin entry point(%s): %d\n", symbol
                 GetLastError());
     }
-    return new_main;
+    return new_sym;
 }
 
 static void cr_plat_init() {
@@ -1536,14 +1536,14 @@ static so_handle cr_so_load(const std::string &new_file) {
     return new_dll;
 }
 
-static cr_plugin_main_func cr_so_symbol(so_handle handle) {
+static void *cr_so_symbol(so_handle handle, const char *symbol) {
     CR_ASSERT(handle);
     dlerror();
-    auto new_main = (cr_plugin_main_func)dlsym(handle, CR_MAIN_FUNC);
-    if (!new_main) {
-        CR_ERROR("Couldn't find plugin entry point: %s\n", dlerror());
+    auto new_sym = dlsym(handle, symbol);
+    if (!new_sym) {
+        CR_ERROR("Couldn't find plugin entry point(%s): %s\n", symbol, dlerror());
     }
-    return new_main;
+    return new_sym;
 }
 
 sigjmp_buf env;
@@ -1669,7 +1669,7 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
             cr_plugin_sections_reload(ctx, cr_plugin_section_version::current);
         }
 
-        auto new_main = cr_so_symbol(new_dll);
+        auto new_main = (cr_plugin_main_func)cr_so_symbol(new_dll, CR_MAIN_FUNC);
         if (!new_main) {
             return false;
         }
