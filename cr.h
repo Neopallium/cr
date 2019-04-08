@@ -1545,13 +1545,30 @@ static void *cr_so_symbol(so_handle handle, const char *symbol) {
     return new_sym;
 }
 
-sigjmp_buf env;
+struct cr_chain_jmpbuf *g_cur_jmpbuf = nullptr;
+
+struct cr_chain_jmpbuf {
+  sigjmp_buf env;
+  struct cr_chain_jmpbuf *prev; // pointer to previous jmpbuf
+
+  cr_chain_jmpbuf() : prev(g_cur_jmpbuf) {
+      // Make this the current `jmpbuf`
+      g_cur_jmpbuf = this;
+  }
+
+  ~cr_chain_jmpbuf() {
+      // Restore previous `jmpbuf`
+      g_cur_jmpbuf = this->prev;
+  }
+};
 
 static void cr_signal_handler(int sig, siginfo_t *si, void *uap) {
     CR_TRACE
     (void)uap;
     CR_ASSERT(si);
-    siglongjmp(env, sig);
+    if (g_cur_jmpbuf) {
+        siglongjmp(g_cur_jmpbuf->env, sig);
+    }
 }
 
 static void cr_plat_init() {
@@ -1595,7 +1612,8 @@ static cr_failure cr_signal_to_failure(int sig) {
 }
 
 static int cr_plugin_main(cr_plugin &ctx, cr_op operation) {
-    if (int sig = sigsetjmp(env, 1)) {
+    cr_chain_jmpbuf jmpbuf;
+    if (int sig = sigsetjmp(jmpbuf.env, 1)) {
         ctx.version = ctx.last_working_version;
         ctx.failure = cr_signal_to_failure(sig);
         CR_LOG("1 FAILURE: %d (CR: %d)\n", sig, ctx.failure);
