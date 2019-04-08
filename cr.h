@@ -448,6 +448,13 @@ struct cr_plugin {
     unsigned int last_working_version;
 };
 
+struct cr_symbol;
+
+struct cr_closure {
+    struct cr_symbol *symbol;
+    void *userdata;
+};
+
 #ifndef CR_HOST
 
 // Guest specific compiler defines/customizations
@@ -616,6 +623,13 @@ struct cr_plugin_segment {
     int64_t size = 0;
 };
 
+struct cr_symbol {
+    struct cr_plugin *ctx = nullptr;
+    struct cr_symbol *next = nullptr;
+    std::string name = {};
+    void *symbol = nullptr;
+};
+
 // keep track of some internal state about the plugin, should not be messed
 // with by user
 struct cr_internal {
@@ -623,6 +637,7 @@ struct cr_internal {
     std::string temppath = {};
     time_t timestamp = {};
     void *handle = nullptr;
+    cr_symbol *symbols = nullptr;
     cr_plugin_main_func main = nullptr;
     cr_plugin_segment seg = {};
     cr_plugin_section data[cr_plugin_section_type::count]
@@ -1108,6 +1123,30 @@ static int cr_seh_filter(cr_plugin &ctx, unsigned long seh) {
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+#ifndef __MINGW32__
+#define CR_CLOSURE_CALL_START(cb_type, userdata, reloadCheck) \
+    auto closure = (struct cr_closure *)(userdata); \
+    CR_ASSERT(closure); \
+    auto sym = closure->symbol; \
+    CR_ASSERT(sym); \
+    auto ctx = sym->ctx; \
+    if (ctx) cr_plugin_check(*ctx, (reloadCheck)); \
+    __try { \
+        auto cb_func = (cb_type)sym->symbol;
+#else
+#define CR_CLOSURE_CALL_START(cb_type, userdata, reloadCheck)
+#endif
+
+#ifndef __MINGW32__
+#define CR_CLOSURE_CALL_END \
+    } __except (cr_seh_filter(ctx, GetExceptionCode())) { \
+        CR_LOG("2 CLOSURE FAILURE: %d\n", ctx->failure); \
+        return -1; \
+    }
+#else
+#define CR_CLOSURE_CALL_END
+#endif
 
 static int cr_plugin_main(cr_plugin &ctx, cr_op operation) {
     auto p = (cr_internal *)ctx.p;
@@ -1611,6 +1650,24 @@ static cr_failure cr_signal_to_failure(int sig) {
     return static_cast<cr_failure>(CR_OTHER + sig);
 }
 
+#define CR_CLOSURE_CALL_START(cb_type, userdata, reloadCheck) \
+    auto closure = (struct cr_closure *)(userdata); \
+    CR_ASSERT(closure); \
+    auto sym = closure->symbol; \
+    CR_ASSERT(sym); \
+    auto ctx = sym->ctx; \
+    if (ctx) cr_plugin_check(*ctx, (reloadCheck)); \
+    if (int sig = sigsetjmp(env, 1)) { \
+        ctx->version = ctx->last_working_version; \
+        ctx->failure = cr_signal_to_failure(sig); \
+        CR_LOG("1 CLOSURE FAILURE: %d (CR: %d)\n", sig, ctx->failure); \
+        return -1; \
+    } else { \
+        auto cb_func = (cb_type)sym->symbol;
+
+#define CR_CLOSURE_CALL_END \
+    }
+
 static int cr_plugin_main(cr_plugin &ctx, cr_op operation) {
     cr_chain_jmpbuf jmpbuf;
     if (int sig = sigsetjmp(jmpbuf.env, 1)) {
@@ -1630,6 +1687,30 @@ static int cr_plugin_main(cr_plugin &ctx, cr_op operation) {
 }
 
 #endif // CR_LINUX || CR_OSX
+
+static bool cr_plugin_reload_symbols(so_handle handle, cr_symbol *symbol) {
+    // check for end of symbol list
+    if(!symbol) return true;
+    auto new_sym = cr_so_symbol(handle, symbol->name.c_str());
+    CR_LOG("reload_symbol '%s' -> %p\n", symbol->name.c_str(), new_sym);
+    if (!new_sym) {
+        return false;
+    }
+    symbol->symbol = new_sym;
+    return cr_plugin_reload_symbols(handle, symbol->next);
+}
+
+static bool cr_plugin_unload_symbols(cr_symbol *symbol, bool close) {
+    // check for end of symbol list
+    if(!symbol) return true;
+    // clear symbol pointer.
+    symbol->symbol = nullptr;
+    if (close) {
+        symbol->ctx = nullptr;
+    }
+    // TODO: reference counting.
+    return cr_plugin_unload_symbols(symbol->next, close);
+}
 
 static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
     CR_TRACE
@@ -1688,6 +1769,12 @@ static bool cr_plugin_load_internal(cr_plugin &ctx, bool rollback) {
 
         auto new_main = (cr_plugin_main_func)cr_so_symbol(new_dll, CR_MAIN_FUNC);
         if (!new_main) {
+            return false;
+        }
+
+        // Reload extra symbols
+        auto reloaded = cr_plugin_reload_symbols(new_dll, p->symbols);
+        if (!reloaded) {
             return false;
         }
 
@@ -1846,6 +1933,7 @@ static int cr_plugin_unload(cr_plugin &ctx, bool rollback, bool close) {
                 cr_plugin_sections_store(ctx);
             }
         }
+        cr_plugin_unload_symbols(p->symbols, close);
         cr_so_unload(ctx);
         p->handle = nullptr;
         p->main = nullptr;
@@ -1888,11 +1976,8 @@ static void cr_plugin_reload(cr_plugin &ctx) {
     }
 }
 
-// This is basically the plugin `main` function, should be called as
-// frequently as your core logic/application needs. -1 and -2 are the only
-// possible return values from cr meaning a fatal error (causes rollback),
-// other return values are returned directly from `cr_main`.
-extern "C" int cr_plugin_update(cr_plugin &ctx, bool reloadCheck = true) {
+// Handle rollbacks and check for reloads.
+extern "C" void cr_plugin_check(cr_plugin &ctx, bool reloadCheck = true) {
     if (ctx.failure) {
         CR_LOG("1 ROLLBACK version was %d\n", ctx.version);
         cr_plugin_rollback(ctx);
@@ -1902,6 +1987,14 @@ extern "C" int cr_plugin_update(cr_plugin &ctx, bool reloadCheck = true) {
             cr_plugin_reload(ctx);
         }
     }
+}
+
+// This is basically the plugin `main` function, should be called as
+// frequently as your core logic/application needs. -1 and -2 are the only
+// possible return values from cr meaning a fatal error (causes rollback),
+// other return values are returned directly from `cr_main`.
+extern "C" int cr_plugin_update(cr_plugin &ctx, bool reloadCheck = true) {
+    cr_plugin_check(ctx, reloadCheck);
 
     // -2 to differentiate from crash handling code path, meaning the crash
     // happened probably during load or unload and not update
@@ -1943,6 +2036,8 @@ extern "C" void cr_plugin_close(cr_plugin &ctx) {
     cr_so_sections_free(ctx);
     auto p = (cr_internal *)ctx.p;
 
+    // TODO: Clear/free cr_symbols
+
     // delete backups
     const auto file = p->fullname;
     for (unsigned int i = 0; i < ctx.version; i++) {
@@ -1958,7 +2053,58 @@ extern "C" void cr_plugin_close(cr_plugin &ctx) {
     ctx.version = 0;
 }
 
+// Get a reloadable symbol from the plugin.
+extern "C" struct cr_symbol *cr_plugin_get_symbol(struct cr_plugin *ctx, const char *name) {
+    CR_TRACE
+    CR_ASSERT(name);
+    auto p = (cr_internal *)ctx->p;
+
+    // TODO: search for existing `cr_symbol`
+    CR_LOG("New plugin symbol: name=%s\n", name);
+    // create new `cr_symbol`
+    auto sym = new(CR_MALLOC(sizeof(cr_symbol))) cr_symbol;
+    sym->ctx = ctx;
+    sym->name = name;
+    // TODO: reference count
+
+    // Check if plugin has been loaded.
+    if (ctx->version > 0) {
+        // then load this symbol right away.
+        cr_plugin_reload_symbols(p->handle, sym);
+    }
+
+    // add symbol to plugin's list of symbols.
+    sym->next = p->symbols;
+    p->symbols = sym;
+
+    return sym;
+}
+
+// Create a C closure for a plugin symbol
+extern "C" struct cr_closure *cr_symbol_new_closure(struct cr_symbol *symbol, void *userdata) {
+    CR_TRACE
+    CR_ASSERT(symbol);
+    CR_LOG("New symbol(%s) closure.\n", symbol->name.c_str());
+    // create new `cr_symbol`
+    auto closure = (cr_closure *)(CR_MALLOC(sizeof(cr_closure)));
+    // TODO: reference count `cr_symbol`
+    closure->symbol = symbol;
+    closure->userdata = userdata;
+    return closure;
+}
+
+// Get raw symbol
+extern "C" void *cr_symbol_get(struct cr_symbol *symbol) {
+    CR_TRACE
+    CR_ASSERT(symbol);
+    return symbol->symbol;
+}
+
 #endif // #ifndef CR_HOST
+
+CR_EXPORT struct cr_symbol *cr_plugin_get_symbol(struct cr_plugin *ctx, const char *name);
+CR_EXPORT struct cr_closure *cr_symbol_new_closure(struct cr_symbol *symbol, void *userdata);
+CR_EXPORT void *cr_symbol_get(struct cr_symbol *symbol);
 
 #endif // __CR_H__
 // clang-format off
