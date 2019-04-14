@@ -1,3 +1,17 @@
+fips_begin_sharedlib(cb_guest cmdline)
+    fips_files(cb_guest.c)
+fips_end_sharedlib()
+
+fips_begin_app(cb_host cmdline)
+    fips_files(cb_host.cpp fake_gui.cpp)
+    if (FIPS_MACOS)
+        fips_libs(dl)
+    endif()
+    if (FIPS_LINUX)
+        fips_libs(dl)
+    endif()
+fips_end_app()
+
 fips_begin_sharedlib(basic_guest cmdline)
     fips_files(basic_guest.c)
 fips_end_sharedlib()
