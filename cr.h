@@ -450,11 +450,6 @@ struct cr_plugin {
 
 struct cr_symbol;
 
-struct cr_closure {
-    struct cr_symbol *symbol;
-    void *userdata;
-};
-
 #ifndef CR_HOST
 
 // Guest specific compiler defines/customizations
@@ -540,6 +535,29 @@ struct cr_closure {
 #define CR_OP_MODE CR_HOST
 #endif
 
+#ifdef _WIN64
+// For Win64
+// Warning: Trampoline functions can not touch the floating-point registers (XMM0-XMM3)
+#define CR_PLUGIN_PARAMS_DEF \
+    void *p1, void *p2, void *p3, void *p4, void *p5, void *p6, \
+    void *f1, void *f2, void *f3, void *f4, void *f5, void *f6
+
+#define CR_PLUGIN_PARAMS \
+    p1, p2, p3, p4, p5, p6, f1, f2, f3, f4, f5, f6
+#else
+#define CR_PLUGIN_PARAMS_DEF \
+    void *p1, void *p2, void *p3, void *p4, void *p5, void *p6, \
+    double f1, double f2, double f3, double f4, double f5, double f6
+
+#define CR_PLUGIN_PARAMS \
+    p1, p2, p3, p4, p5, p6, f1, f2, f3, f4, f5, f6
+#endif
+
+#define CR_TRAMPOLINE_PARAMS_DEF \
+    int slot, CR_PLUGIN_PARAMS_DEF
+#define CR_TRAMPOLINE_PARAMS \
+    slot, CR_PLUGIN_PARAMS
+
 #include <algorithm>
 #include <chrono>  // duration for sleep
 #include <cstring> // memcpy
@@ -623,11 +641,14 @@ struct cr_plugin_segment {
     int64_t size = 0;
 };
 
+typedef void *(cr_plugin_func)(CR_PLUGIN_PARAMS_DEF);
+
 struct cr_symbol {
     struct cr_plugin *ctx = nullptr;
     struct cr_symbol *next = nullptr;
     std::string name = {};
     void *symbol = nullptr;
+    int slot = -1;
 };
 
 // keep track of some internal state about the plugin, should not be messed
@@ -1125,24 +1146,20 @@ static int cr_seh_filter(cr_plugin &ctx, unsigned long seh) {
 }
 
 #ifndef __MINGW32__
-#define CR_CLOSURE_CALL_START(cb_type, userdata, reloadCheck) \
-    auto closure = (struct cr_closure *)(userdata); \
-    CR_ASSERT(closure); \
-    auto sym = closure->symbol; \
+#define CR_CLOSURE_CALL_START(sym, reloadCheck) \
     CR_ASSERT(sym); \
-    auto ctx = sym->ctx; \
+    auto ctx = (sym)->ctx; \
     if (ctx) cr_plugin_check(*ctx, (reloadCheck)); \
-    __try { \
-        auto cb_func = (cb_type)sym->symbol;
+    __try {
 #else
-#define CR_CLOSURE_CALL_START(cb_type, userdata, reloadCheck)
+#define CR_CLOSURE_CALL_START(sym, reloadCheck)
 #endif
 
 #ifndef __MINGW32__
 #define CR_CLOSURE_CALL_END \
     } __except (cr_seh_filter(ctx, GetExceptionCode())) { \
         CR_LOG("2 CLOSURE FAILURE: %d\n", ctx->failure); \
-        return -1; \
+        return 0; \
     }
 #else
 #define CR_CLOSURE_CALL_END
@@ -1650,20 +1667,17 @@ static cr_failure cr_signal_to_failure(int sig) {
     return static_cast<cr_failure>(CR_OTHER + sig);
 }
 
-#define CR_CLOSURE_CALL_START(cb_type, userdata, reloadCheck) \
-    auto closure = (struct cr_closure *)(userdata); \
-    CR_ASSERT(closure); \
-    auto sym = closure->symbol; \
+#define CR_CLOSURE_CALL_START(sym, reloadCheck) \
+    cr_chain_jmpbuf jmpbuf; \
     CR_ASSERT(sym); \
-    auto ctx = sym->ctx; \
+    auto ctx = (sym)->ctx; \
     if (ctx) cr_plugin_check(*ctx, (reloadCheck)); \
-    if (int sig = sigsetjmp(env, 1)) { \
+    if (int sig = sigsetjmp(jmpbuf.env, 1)) { \
         ctx->version = ctx->last_working_version; \
         ctx->failure = cr_signal_to_failure(sig); \
         CR_LOG("1 CLOSURE FAILURE: %d (CR: %d)\n", sig, ctx->failure); \
-        return -1; \
-    } else { \
-        auto cb_func = (cb_type)sym->symbol;
+        return 0; \
+    } else {
 
 #define CR_CLOSURE_CALL_END \
     }
@@ -2080,17 +2094,134 @@ extern "C" struct cr_symbol *cr_plugin_get_symbol(struct cr_plugin *ctx, const c
     return sym;
 }
 
-// Create a C closure for a plugin symbol
-extern "C" struct cr_closure *cr_symbol_new_closure(struct cr_symbol *symbol, void *userdata) {
+#ifndef MAX_SLOTS
+#define MAX_SLOTS 400
+#endif
+
+#if MAX_SLOTS > 1000
+#error "Unsupported MAX_SLOTS > 1000"
+#elif MAX_SLOTS > 900
+#define SLOTS 1000
+#define TR_FUNC_REPEAT TR_FUNC_A9
+#elif MAX_SLOTS > 800
+#define SLOTS 900
+#define TR_FUNC_REPEAT TR_FUNC_A4 TR_FUNC_B(5) TR_FUNC_B(6) TR_FUNC_B(7) TR_FUNC_B(8)
+#elif MAX_SLOTS > 700
+#define SLOTS 800
+#define TR_FUNC_REPEAT TR_FUNC_A4 TR_FUNC_B(5) TR_FUNC_B(6) TR_FUNC_B(7)
+#elif MAX_SLOTS > 600
+#define SLOTS 700
+#define TR_FUNC_REPEAT TR_FUNC_A4 TR_FUNC_B(5) TR_FUNC_B(6)
+#elif MAX_SLOTS > 500
+#define SLOTS 600
+#define TR_FUNC_REPEAT TR_FUNC_A4 TR_FUNC_B(5)
+#elif MAX_SLOTS > 400
+#define SLOTS 500
+#define TR_FUNC_REPEAT TR_FUNC_A4
+#elif MAX_SLOTS > 300
+#define SLOTS 400
+#define TR_FUNC_REPEAT TR_FUNC_B(0) TR_FUNC_B(1) TR_FUNC_B(2) TR_FUNC_B(3)
+#elif MAX_SLOTS > 200
+#define SLOTS 300
+#define TR_FUNC_REPEAT TR_FUNC_B(0) TR_FUNC_B(1) TR_FUNC_B(2)
+#elif MAX_SLOTS > 100
+#define SLOTS 200
+#define TR_FUNC_REPEAT TR_FUNC_B(0) TR_FUNC_B(1)
+#else
+#define SLOTS 100
+#define TR_FUNC_REPEAT TR_FUNC_B(0)
+#endif
+#undef MAX_SLOTS
+#define MAX_SLOTS SLOTS
+
+static cr_symbol *g_closure_slots[MAX_SLOTS];
+static int g_closure_next_slot = 0;
+static int g_closure_freed_slots = 0;
+
+void *cr_trampoline_func_handler(CR_TRAMPOLINE_PARAMS_DEF) {
+    cr_symbol *symbol = g_closure_slots[slot];
+    if (!symbol) return 0;
+    CR_CLOSURE_CALL_START(symbol, true)
+    cr_plugin_func *func = (cr_plugin_func*)symbol->symbol;
+    if (func) {
+        return func(CR_PLUGIN_PARAMS);
+    }
+    CR_CLOSURE_CALL_END
+    return 0;
+}
+
+#define TR_FUNC_SLOT(a,b,c) (((a) * 100) + ((b) * 10) + c)
+#define TR_FUNC_NAME(a,b,c) cr_trampoline_func_ ## a ## b ## c
+
+#define TR_FUNC_C(a,b) \
+    TR_FUNC(a,b,0) TR_FUNC(a,b,1) TR_FUNC(a,b,2) TR_FUNC(a,b,3) TR_FUNC(a,b,4) \
+    TR_FUNC(a,b,5) TR_FUNC(a,b,6) TR_FUNC(a,b,7) TR_FUNC(a,b,8) TR_FUNC(a,b,9)
+
+#define TR_FUNC_B(a) \
+    TR_FUNC_C(a,0) TR_FUNC_C(a,1) TR_FUNC_C(a,2) TR_FUNC_C(a,3) TR_FUNC_C(a,4) \
+    TR_FUNC_C(a,5) TR_FUNC_C(a,6) TR_FUNC_C(a,7) TR_FUNC_C(a,8) TR_FUNC_C(a,9)
+
+#define TR_FUNC_A4 TR_FUNC_B(0) TR_FUNC_B(1) TR_FUNC_B(2) TR_FUNC_B(3) TR_FUNC_B(4)
+#define TR_FUNC_A9 TR_FUNC_A4 TR_FUNC_B(5) TR_FUNC_B(6) TR_FUNC_B(7) TR_FUNC_B(8) TR_FUNC_B(9)
+
+#define TR_FUNC(a,b,c) \
+    void *TR_FUNC_NAME(a,b,c)(CR_PLUGIN_PARAMS_DEF) { \
+        int slot = TR_FUNC_SLOT(a,b,c); \
+        return cr_trampoline_func_handler(CR_TRAMPOLINE_PARAMS); \
+    }
+TR_FUNC_REPEAT
+#undef TR_FUNC
+
+#define TR_FUNC(a,b,c) \
+    TR_FUNC_NAME(a,b,c),
+static cr_plugin_func * const g_trampoline_slots[] = {
+TR_FUNC_REPEAT
+};
+#undef TR_FUNC
+
+static int cr_closure_get_free_slot() {
+    // try to re-used freed slots.
+    if (g_closure_freed_slots > 0) {
+        int max = g_closure_next_slot;
+        for (int i = 0; i < max; i++) {
+            if (g_closure_slots[i] == nullptr) {
+                g_closure_freed_slots--;
+                return i;
+            }
+        }
+    }
+    int slot = g_closure_next_slot;
+    if (slot >= MAX_SLOTS) return -1;
+    g_closure_next_slot++;
+    return slot;
+}
+
+extern "C" void cr_symbol_free(cr_symbol *symbol) {
+    CR_ASSERT(symbol);
+    int slot = symbol->slot;
+    CR_ASSERT(slot >= 0 && slot < MAX_SLOTS);
+    g_closure_slots[slot] = nullptr;
+    g_closure_freed_slots++;
+}
+
+// Wrap `cr_symbol` in a generic closure.
+extern "C" void *cr_symbol_get_closure(struct cr_symbol *symbol) {
     CR_TRACE
     CR_ASSERT(symbol);
     CR_LOG("New symbol(%s) closure.\n", symbol->name.c_str());
-    // create new `cr_symbol`
-    auto closure = (cr_closure *)(CR_MALLOC(sizeof(cr_closure)));
     // TODO: reference count `cr_symbol`
-    closure->symbol = symbol;
-    closure->userdata = userdata;
-    return closure;
+    // Get slot number
+    int slot = symbol->slot;
+    if (slot < 0) {
+        slot = cr_closure_get_free_slot();
+        CR_LOG("---- use slot=%d\n", slot);
+        if (slot < 0) return 0;
+
+        symbol->slot = slot;
+        g_closure_slots[slot] = symbol;
+    }
+    // return trampoline function
+    return (void *)g_trampoline_slots[slot];
 }
 
 // Get raw symbol
@@ -2103,7 +2234,7 @@ extern "C" void *cr_symbol_get(struct cr_symbol *symbol) {
 #endif // #ifndef CR_HOST
 
 CR_EXPORT struct cr_symbol *cr_plugin_get_symbol(struct cr_plugin *ctx, const char *name);
-CR_EXPORT struct cr_closure *cr_symbol_new_closure(struct cr_symbol *symbol, void *userdata);
+CR_EXPORT void *cr_symbol_get_closure(struct cr_symbol *symbol);
 CR_EXPORT void *cr_symbol_get(struct cr_symbol *symbol);
 
 #endif // __CR_H__
