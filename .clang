@@ -1,0 +1,13 @@
+-std=c++11
+-Wall
+-Wextra
+-Wshadow
+-W
+-pedantic
+-Wno-unused-parameter
+-Wno-shadow
+-Wno-unused-function
+-Wno-unknown-pragmas
+-Wno-ignored-attributes
+-DCR_DEPLOY_PATH="../"
+-I../fips-googletest/gtest/googletest/include/
